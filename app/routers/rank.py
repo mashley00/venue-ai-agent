@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from typing import List
 import pandas as pd
 from fastapi.responses import HTMLResponse
-from app.services import scoring, places, yelp, extract
+from app.services import scoring, places, yelp, extract, merge
 
 router = APIRouter()
 
