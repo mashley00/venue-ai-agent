@@ -109,7 +109,8 @@ def preview(payload: dict):
     }
     """
     # Discover candidates
-    candidates = places.discover(payload) + yelp.discover(payload)
+from app.services import merge  # add at top if not present
+candidates = merge.merge_candidates(places.discover(payload), yelp.discover(payload))
     # Enrich (stubbed now)
     enriched = [extract.enrich(v) for v in candidates]
     # Rank
@@ -129,7 +130,8 @@ def preview_sample():
       "attendees": 30,
       "preferred_slots": ["11:00","11:30","18:00","18:30"]
     }
-    candidates = places.discover(payload) + yelp.discover(payload)
+from app.services import merge  # add at top if not present
+candidates = merge.merge_candidates(places.discover(payload), yelp.discover(payload))
     enriched = [extract.enrich(v) for v in candidates]
     ranked = _rank_inline(enriched)
     table_html = _to_html_table(ranked)
