@@ -5,39 +5,49 @@ def _norm(s: str) -> str:
     if not s: return ""
     s = s.lower()
     s = re.sub(r"[\.\,\-\(\)\'\"\&/]", " ", s)
+    s = re.sub(r"\b(inc|llc|co|corp|the|center|centre|community)\b", "", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # drop common suffixes
-    s = re.sub(r"\b(inc|llc|co|corp|the|center|centre)\b", "", s)
-    return re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _coord_bucket(v: dict) -> str:
+    # bucket lat/lng to ~30m grid to coalesce close duplicates
+    lat, lng = v.get("lat"), v.get("lng")
+    if lat is None or lng is None:
+        return ""
+    return f"{round(lat, 4)}:{round(lng, 4)}"
 
 def _key(v: dict) -> Tuple[str, str]:
-    return (_norm(v.get("name","")), _norm(v.get("city","")))
+    name = _norm(v.get("name",""))
+    addr = _norm(v.get("address",""))
+    if addr:
+        return (name, addr)
+    # fall back to coord bucket, then city
+    cb = _coord_bucket(v)
+    if cb:
+        return (name, cb)
+    return (name, _norm(v.get("city","")))
 
 def merge_candidates(google_list: List[dict], yelp_list: List[dict]) -> List[dict]:
-    """
-    Simple, fast de-dupe by (normalized name, city).
-    Prefer entries with Google place_id. Merge phone/website/rating.
-    """
     merged: Dict[Tuple[str,str], dict] = {}
 
     def _merge(a: dict, b: dict) -> dict:
         out = dict(a)
-        for k in ["address","website_url","booking_url","phone","availability_status","educationality","distance_miles"]:
+        # Prefer Google’s IDs if present
+        for k in ["place_id","yelp_id","lat","lng","source"]:
             out[k] = out.get(k) or b.get(k)
-        # preserve IDs/sources
-        for k in ["place_id","yelp_id","source"]:
+        # Fill blanks from b
+        for k in ["address","website_url","booking_url","phone","availability_status","educationality","distance_miles","category"]:
             out[k] = out.get(k) or b.get(k)
-        # take better rating if present
-        if b.get("yelp_rating"):
-            out["yelp_rating"] = b.get("yelp_rating")
-            out["yelp_review_count"] = b.get("yelp_review_count")
+        # Keep shorter distance if available
+        if out.get("distance_miles") is None and b.get("distance_miles") is not None:
+            out["distance_miles"] = b["distance_miles"]
+        elif out.get("distance_miles") is not None and b.get("distance_miles") is not None:
+            out["distance_miles"] = min(out["distance_miles"], b["distance_miles"])
         return out
 
-    # seed with Google first
     for g in google_list:
         merged[_key(g)] = g
 
-    # fold in Yelp
     for y in yelp_list:
         k = _key(y)
         if k in merged:
@@ -45,6 +55,5 @@ def merge_candidates(google_list: List[dict], yelp_list: List[dict]) -> List[dic
         else:
             merged[k] = y
 
-    # rank-friendly array
-    out = list(merged.values())
-    return out
+    return list(merged.values())
+
