@@ -1,0 +1,18 @@
+{
+  "cities": [
+    "Greenville, NC"
+  ],
+  "zips": [
+    "27834"
+  ],
+  "radius_miles": 6,
+  "window_start": "2025-05-08",
+  "window_end": "2025-05-22",
+  "attendees": 30,
+  "preferred_slots": [
+    "11:00",
+    "11:30",
+    "18:00",
+    "18:30"
+  ]
+}
