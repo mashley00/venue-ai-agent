@@ -1,68 +1,46 @@
-import os, random
+import os, requests
 
-# NOTE: This is a mocked discovery function for MVP.
-# Replace with real Google Places Text/Nearby Search + Place Details calls.
-# Keep logic identical: return a list of normalized dicts.
+API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 
-def discover(payload: dict) -> list[dict]:
-    cities = payload.get("cities", [])
-    zips = payload.get("zips", [])
-    radius = payload.get("radius_miles", 6)
+def discover(payload: dict):
+    """Search Google Places API for educational venues."""
+    cities = payload.get("cities") or []
+    zips = payload.get("zips") or []
+    radius = int(payload.get("radius_miles", 6)) * 1609
+    attendees = payload.get("attendees", 30)
 
-    samples = []
-    for city in cities or ["Sample City"]:
-        samples += [
-            {
-                "name": f"{city} Public Library",
-                "category": "library",
-                "educationality": 1.0,
-                "address": f"123 Main St, {city}",
-                "city": city,
-                "state": "",
-                "zip": zips[0] if zips else "",
-                "distance_miles": round(random.uniform(0.5, radius), 1),
-                "website_url": "https://example.org/library",
-                "booking_url": "https://example.org/library/rooms",
-                "phone": "(555) 123-4567",
-                "amenities": {
-                    "projector": True, "screen_tv": True, "wifi": True, "tables_chairs": True
-                },
-                "availability_status": "unknown",
-                "availability_source": None
-            },
-            {
-                "name": f"{city} Community College – Continuing Ed",
-                "category": "community_college",
-                "educationality": 0.9,
-                "address": f"45 College Ave, {city}",
-                "city": city,
-                "state": "",
-                "zip": zips[0] if zips else "",
-                "distance_miles": round(random.uniform(1.0, radius), 1),
-                "website_url": "https://example.edu/venue",
-                "booking_url": None,
-                "phone": "(555) 222-9090",
-                "amenities": {
-                    "projector": True, "screen_tv": True, "wifi": True, "tables_chairs": True
-                },
-                "availability_status": "unknown",
-                "availability_source": None
-            },
-            {
-                "name": f"{city} Hotel & Conference Center",
-                "category": "hotel_conference",
-                "educationality": 0.4,
-                "address": f"9 Center Blvd, {city}",
-                "city": city,
-                "state": "",
-                "zip": zips[0] if zips else "",
-                "distance_miles": round(random.uniform(0.8, radius), 1),
-                "website_url": "https://example.com/hotel",
-                "booking_url": "https://example.com/hotel/meetings",
-                "phone": "(555) 333-7777",
-                "amenities": {"projector": True, "screen_tv": True, "wifi": True, "tables_chairs": True},
-                "availability_status": "unknown",
-                "availability_source": None
-            }
-        ]
-    return samples
+    query_bases = ["library", "community college", "technical school", "senior center", "community center"]
+    results = []
+
+    # Build location targets
+    targets = cities if cities else zips
+    for target in targets:
+        for q in query_bases:
+            query = f"{q} near {target}"
+            url = (
+                "https://maps.googleapis.com/maps/api/place/textsearch/json"
+                f"?query={requests.utils.quote(query)}&radius={radius}&key={API_KEY}"
+            )
+            try:
+                r = requests.get(url, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                print(f"[places] error {e}")
+                continue
+
+            for item in data.get("results", []):
+                results.append({
+                    "name": item.get("name"),
+                    "address": item.get("formatted_address"),
+                    "place_id": item.get("place_id"),
+                    "city": target,
+                    "category": q,
+                    "website_url": None,
+                    "phone": None,
+                    "availability_status": "unknown",
+                    "educationality": 1.0 if "library" in q else 0.8,
+                    "distance_miles": None,
+                })
+    return results
+
