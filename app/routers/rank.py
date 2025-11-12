@@ -4,6 +4,33 @@ from typing import List
 import pandas as pd
 
 from app.services import scoring, places, yelp, extract, merge
+from app.services.geo import geocode, haversine_miles
+
+def _final_radius_filter(cands: list, payload: dict) -> list:
+    cities = payload.get("cities") or []
+    zips = payload.get("zips") or []
+    radius_miles = int(payload.get("radius_miles", 6))
+    targets = cities if cities else zips
+    anchors = []
+    for t in targets:
+        g = geocode(t)
+        if g:
+            anchors.append((g["lat"], g["lng"]))
+    if not anchors:
+        return cands
+    kept = []
+    for v in cands:
+        vlat, vlng = v.get("lat"), v.get("lng")
+        if vlat is None or vlng is None:
+            continue
+        in_any = False
+        for (alat, alng) in anchors:
+            if haversine_miles(alat, alng, vlat, vlng) <= radius_miles:
+                in_any = True
+                break
+        if in_any:
+            kept.append(v)
+    return kept
 
 router = APIRouter()
 
