@@ -1,282 +1,189 @@
-from typing import List
-from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from typing import List, Dict, Any
 
-from app.services import places, merge, anchors, extract, scoring
+from fastapi import APIRouter
 
-router = APIRouter(prefix="/rank", tags=["rank"])
+from app.schemas.rank import RankPreviewPayload, RankPreviewResult
+from app.services import places, merge, extract, scoring
 
-
-# -----------------------
-# Models
-# -----------------------
+router = APIRouter()
 
 
-class RankPayload(BaseModel):
-    city: str = Field("", description="Primary city (for context only)")
-    zips: List[str] = Field(default_factory=list, description="ZIP codes to anchor search")
-    radius: float = Field(6.0, description="Search radius in miles")
-    topic: str = Field("tir", description="Seminar topic code (TIR/EP/SS/etc.)")
-
-    @classmethod
-    def from_ui(cls, city: str, zips: str, miles: float, topic: str) -> "RankPayload":
-        zips_list = [z.strip() for z in (zips or "").split(",") if z.strip()]
-        return cls(
-            city=city or "",
-            zips=zips_list,
-            radius=miles or 6.0,
-            topic=(topic or "").lower(),
-        )
+# --- Helper utilities -----------------------------------------------------
 
 
-# -----------------------
-# Helpers – distance & filters
-# -----------------------
-
-
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Simple haversine distance in statute miles."""
-    from math import radians, sin, cos, asin, sqrt
-
-    R = 3958.8  # Earth radius in miles
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    c = 2 * asin(sqrt(a))
-    return R * c
-
-
-# Names we NEVER want as venues (case-insensitive, substring match)
-EXCLUDED_NAME_KEYWORDS = [
-    # senior / assisted living style housing
+EXCLUDED_KEYWORDS: List[str] = [
+    # senior / long-term care
     "assisted living",
+    "independent living",
     "senior living",
     "senior apartments",
-    "independent living",
+    "senior apartment",
+    "retirement community",
     "memory care",
+    "nursing home",
+    "rehabilitation center",
+    "rehab center",
+    "skilled nursing",
     "post acute",
     "post-acute",
-    "rehab center",
-    "rehabilitation center",
-    "skilled nursing",
-    "nursing home",
-    "long term care",
-    "ltc center",
-    "home care",
-    "hospice",
-    # residential / apartment-style
+    # housing / residential
     "apartments",
-    "apartment homes",
-    "apartment community",
-    "condominiums",
+    "apartment",
     "condominium",
-    "townhomes",
+    "condominiums",
+    "condo",
+    "condos",
     # neighborhood / hoa
-    "neighborhood association",
     "homeowners association",
-    "hoa office",
-    # misc clearly non-venue matches
+    "hoa",
+    "neighborhood association",
+    "civic association",
+    # misc clearly non-venues
+    "funeral home",
+    "mortuary",
+    "cemetery",
     "little free library",
+    "free little library",
 ]
 
 
-def _looks_irrelevant(venue: dict) -> bool:
-    """Return True if the venue name clearly indicates a bad / unusable type."""
-    name = (venue.get("name") or "").lower()
-    if not name:
+def _attr(payload: Any, *names: str, default=None):
+    """
+    Safely read a field from the payload, trying several possible names so
+    we don't depend on the exact Pydantic schema.
+    """
+    for name in names:
+        if hasattr(payload, name):
+            return getattr(payload, name)
+    return default
+
+
+def normalize_zip_list(raw) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        zips = raw
+    else:
+        zips = str(raw).split(",")
+    return [z.strip() for z in zips if z and z.strip()]
+
+
+def is_irrelevant_venue(candidate: Dict[str, Any]) -> bool:
+    """
+    Drop obviously bad venue types based on name / category keywords.
+    This is intentionally conservative – we only filter when we're very sure.
+    """
+    name = (candidate.get("name") or "").lower()
+    # common fields that might hold types / categories
+    categories = candidate.get("types") or candidate.get("categories") or []
+    if isinstance(categories, list):
+        cat_text = " ".join(str(c) for c in categories).lower()
+    else:
+        cat_text = str(categories).lower()
+
+    haystack = f"{name} {cat_text}"
+
+    for kw in EXCLUDED_KEYWORDS:
+        if kw in haystack:
+            return True
+
+    return False
+
+
+def matches_geography(candidate: Dict[str, Any], payload: Any) -> bool:
+    """
+    Best-effort geo filter using whatever address info we have on the candidate.
+    We *don't* assume a particular shape of the candidate or payload.
+    """
+    city = (_attr(payload, "city", "City", default="") or "").strip().lower()
+    state = (_attr(payload, "state", "State", default="") or "").strip().lower()
+    zip_raw = _attr(payload, "zip_codes", "zipcodes", "zips", "postal_codes", default=[])
+    zip_list = normalize_zip_list(zip_raw)
+
+    # Build a single address string from all plausible fields on the candidate.
+    addr_bits: List[str] = []
+    for key in ("formatted_address", "address", "vicinity", "city", "state", "postal_code", "zipcode", "zip"):
+        val = candidate.get(key)
+        if val:
+            addr_bits.append(str(val))
+    address = " ".join(addr_bits).lower()
+
+    # If we have zip codes, require at least one to appear in the address.
+    if zip_list:
+        if not any(z.lower() in address for z in zip_list):
+            # allow a fallback where we still keep it if city+state both match
+            pass_zip = False
+        else:
+            pass_zip = True
+    else:
+        pass_zip = True  # no zip constraint
+
+    # city + state checks (only applied when present in payload)
+    city_ok = True
+    if city:
+        city_ok = city in address
+
+    state_ok = True
+    if state:
+        state_ok = state in address
+
+    # Require state to match when provided.
+    if state and not state_ok:
         return False
-    return any(kw in name for kw in EXCLUDED_NAME_KEYWORDS)
+
+    # If we have zips, we want (zip OR (city+state))
+    if zip_list:
+        return pass_zip or (city_ok and state_ok)
+
+    # No zips – fall back to city+state when available.
+    if city and state:
+        return city_ok and state_ok
+    if city:
+        return city_ok
+    if state:
+        return state_ok
+
+    # If we truly know nothing, don't filter it out here.
+    return True
 
 
-def _final_radius_filter(
-    cands: List[dict],
-    geocoded_anchors: List[dict],
-    radius_miles: float,
-) -> List[dict]:
-    """Attach distance_miles and drop venues outside the radius or obviously bad ones."""
-    # Build a list of anchor (lat, lng) tuples from the geocoder
-    anchors_xy = []
-    for g in geocoded_anchors or []:
-        if not g:
-            continue
-        lat = g.get("lat")
-        lng = g.get("lng")
-        if lat is None or lng is None:
-            continue
-        anchors_xy.append((lat, lng))
-
-    # If we somehow have no anchors, just return the candidates unchanged
-    if not anchors_xy:
-        return cands
-
-    filtered: List[dict] = []
-    for v in cands:
-        vlat = v.get("lat")
-        vlng = v.get("lng")
-        if vlat is None or vlng is None:
-            # If we can't place it on a map, we can't use it for geo-based work
-            continue
-
-        # How far is this venue from the closest anchor?
-        min_dist = min(
-            haversine_miles(alat, alng, vlat, vlng) for (alat, alng) in anchors_xy
-        )
-        v["distance_miles"] = round(min_dist, 2)
-
-        if min_dist > radius_miles:
-            continue
-        if _looks_irrelevant(v):
-            continue
-
-        filtered.append(v)
-
-    return filtered
+# --- API endpoints --------------------------------------------------------
 
 
-def _rank_inline(venues: List[dict]) -> List[dict]:
-    ranked = []
-    for v in venues:
-        total, reason, comps = scoring.score(v)
-        v["score_total"] = total
-        v["reason_text"] = reason
-        v["score_components"] = comps
-        ranked.append(v)
+@router.post("/rank/preview", response_model=RankPreviewResult)
+def preview(payload: RankPreviewPayload) -> RankPreviewResult:
+    """
+    Preview rank and candidate venues.
 
-    ranked.sort(key=lambda x: x.get("score_total", 0), reverse=True)
-    for i, v in enumerate(ranked, start=1):
-        v["rank"] = i
-    return ranked
-
-
-TABLE_COLUMNS = [
-    ("rank", "Rank"),
-    ("name", "Venue"),
-    ("city", "City"),
-    ("state", "State"),
-    ("distance_miles", "Dist (mi)"),
-    ("source", "Source"),
-    ("phone", "Phone"),
-    ("score_total", "Score"),
-    ("reason_text", "Why it scored this way"),
-    ("maps_url", "Maps / Website"),
-]
-
-
-def _to_html_table(ranked: List[dict]) -> str:
-    rows = []
-    for v in ranked:
-        row = {col_key: v.get(col_key) for col_key, _ in TABLE_COLUMNS}
-        if row.get("maps_url"):
-            row["name"] = (
-                f"<a href='{row['maps_url']}' target='_blank'>{row['name']}</a>"
-            )
-        rows.append(row)
-
-    header_cells = "".join(f"<th>{label}</th>" for _, label in TABLE_COLUMNS)
-    header = f"<tr>{header_cells}</tr>"
-
-    body_rows = []
-    for row in rows:
-        cells = "".join(
-            f"<td>{'' if v is None else v}</td>"
-            for key, _ in TABLE_COLUMNS
-            for v in [row.get(key)]
-        )
-        body_rows.append(f"<tr>{cells}</tr>")
-
-    table_html = (
-        "<table><thead>"
-        + header
-        + "</thead><tbody>"
-        + "".join(body_rows)
-        + "</tbody></table>"
-    )
-    return table_html
-
-
-CSS = """<style>
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:20px;}
-h1{font-size:20px;margin-bottom:4px;}
-p.hint{font-size:13px;color:#666;margin-top:0;margin-bottom:16px;}
-table{border-collapse:collapse;width:100%;font-size:13px;}
-th,td{padding:8px 10px;border-bottom:1px solid #eee;vertical-align:top;}
-th{text-align:left;background:#fafafa;}
-a{color:#0a58ca;text-decoration:none;}
-a:hover{text-decoration:underline;}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;background:#eef;border:1px solid #dde;}
-</style>"""
-
-
-def _wrap_html(inner: str, title: str = "Venue Preview") -> str:
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{title}</title>{CSS}</head><body>"
-        "<h1>Venue Preview</h1>"
-        "<p class='hint'>This is a quick on-screen preview. "
-        "Use <code>/rank/run</code> for JSON/CSV/XLSX exports.</p>"
-        + inner
-        + "</body></html>"
-    )
-
-
-# -----------------------
-# Routes
-# -----------------------
-
-
-@router.post("/run")
-def run_rank(payload: RankPayload):
-    """JSON-oriented endpoint (for future CSV/XLSX export)."""
-    geo_anchors = anchors.compute_anchors(payload)
-
+    Flow:
+    1. Discover candidates from Google Places (and optionally Yelp later).
+    2. Merge / dedupe with existing merge service.
+    3. Apply geo-radius and keyword filters to drop irrelevant venues.
+    4. Enrich + score remaining candidates.
+    """
+    # 1) Discover from Google
     google_list = places.discover(payload)
-    # Yelp integration is not wired yet; pass an empty list for now
-    candidates = merge.merge_candidates(google_list, [])
 
-    filtered = _final_radius_filter(candidates, geo_anchors, payload.radius)
-    ranked = _rank_inline(filtered)
-    return {"count": len(ranked), "results": ranked}
+    # 2) Merge candidates – we currently don't use Yelp; pass an empty list
+    #    to satisfy the merge_candidates signature (google_list, yelp_list).
+    merged: List[Dict[str, Any]] = merge.merge_candidates(google_list, [])
 
+    # 3) Apply geo + relevance filters
+    filtered: List[Dict[str, Any]] = []
+    for cand in merged:
+        if not matches_geography(cand, payload):
+            continue
+        if is_irrelevant_venue(cand):
+            continue
+        filtered.append(cand)
 
-@router.post("/preview", response_class=HTMLResponse)
-def preview(
-    request: Request,
-    city: str = Query("", description="City name, e.g. 'Clarkston'"),
-    zips: str = Query("", description="Comma-separated ZIP codes"),
-    miles: float = Query(6.0, description="Radius in miles"),
-    topic: str = Query("tir", description="Seminar topic (TIR/EP/SS/etc.)"),
-):
-    """UI helper – used by /ui page for quick visual previews."""
-    payload = RankPayload.from_ui(city, zips, miles, topic)
+    # 4) Enrich & score
+    enriched = [extract.enrich(v) for v in filtered]
+    sorted_scores = scoring.rank(enriched)
 
-    geo_anchors = anchors.compute_anchors(payload)
-    google_list = places.discover(payload)
-    candidates = merge.merge_candidates(google_list, [])
-
-    filtered = _final_radius_filter(candidates, geo_anchors, payload.radius)
-    ranked = _rank_inline(filtered)
-    html_table = _to_html_table(ranked[:200])  # cap to keep UI snappy
-
-    return HTMLResponse(_wrap_html(html_table))
-
-
-@router.get("/sample", response_class=HTMLResponse)
-def sample(request: Request):
-    """Tiny helper for quick manual smoke testing from the browser."""
-    sample_payload = RankPayload(
-        city="Clarkston",
-        zips=["48348"],
-        radius=6.0,
-        topic="tir",
+    return RankPreviewResult(
+        results=sorted_scores,
+        candidates=enriched,
     )
-    geo_anchors = anchors.compute_anchors(sample_payload)
-    google_list = places.discover(sample_payload)
-    candidates = merge.merge_candidates(google_list, [])
-
-    filtered = _final_radius_filter(candidates, sample_payload.radius, sample_payload.radius)
-    ranked = _rank_inline(filtered)
-    html_table = _to_html_table(ranked[:100])
-    return HTMLResponse(_wrap_html(html_table, title="Sample Venue Preview"))
 
 
