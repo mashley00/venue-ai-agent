@@ -109,8 +109,7 @@ def _wrap_html(inner: str, title="Venue Preview") -> str:
 def run_rank(payload: dict):
     # 1) Discover (Google + Yelp) and merge/de-dupe
     candidates = merge.merge_candidates(
-        places.discover(payload),
-        yelp.discover(payload)
+        places.discover(payload)
     )
     # 2) Enrich (stub for now)
     enriched = [extract.enrich(v) for v in candidates]
@@ -140,8 +139,7 @@ def run_rank(payload: dict):
 def preview(payload: dict):
     # 1) Discover (Google + Yelp) and merge/de-dupe
     candidates = merge.merge_candidates(
-        places.discover(payload),
-        yelp.discover(payload)
+        places.discover(payload)
     )
     # 2) Enrich (stub for now)
     enriched = [extract.enrich(v) for v in candidates]
@@ -162,8 +160,7 @@ def preview_sample():
         "preferred_slots": ["11:00","11:30","18:00","18:30"]
     }
     candidates = merge.merge_candidates(
-        places.discover(payload),
-        yelp.discover(payload)
+        places.discover(payload)
     )
     enriched = [extract.enrich(v) for v in candidates]
     ranked = _rank_inline(enriched)
