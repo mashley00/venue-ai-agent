@@ -1,8 +1,7 @@
 from typing import List, Dict, Any, Iterable
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 
-from app.schemas.rank import RankPreviewPayload, RankPreviewResult
 from app.services import places, merge, extract, scoring
 
 router = APIRouter()
@@ -297,8 +296,8 @@ def matches_geography(candidate: Dict[str, Any], payload: Dict[str, Any]) -> boo
 # --- Router endpoint ------------------------------------------------------
 
 
-@router.post("/preview", response_model=RankPreviewResult)
-def preview(payload: RankPreviewPayload) -> RankPreviewResult:
+@router.post("/preview")
+def preview(payload: dict = Body(...)) -> Dict[str, Any]:
     """
     Preview ranked venue candidates.
 
@@ -307,15 +306,17 @@ def preview(payload: RankPreviewPayload) -> RankPreviewResult:
       2. Merge/dedupe via app.services.merge.merge_candidates.
       3. Apply geography and keyword filters.
       4. Enrich & score remaining candidates.
-      5. Return RankPreviewResult with both scores and raw candidates.
+      5. Return a dict with both scores and raw candidates.
     """
-    # Make sure we pass a dict into services that expect mapping-style access
-    if hasattr(payload, "dict"):
-        payload_dict: Dict[str, Any] = payload.dict()
-    elif isinstance(payload, dict):
-        payload_dict = payload
+    # Ensure mapping-style access everywhere
+    if isinstance(payload, dict):
+        payload_dict: Dict[str, Any] = payload
     else:
-        payload_dict = {}
+        # Extremely defensive: if something else is passed, try best-effort
+        try:
+            payload_dict = dict(payload)  # type: ignore[arg-type]
+        except Exception:
+            payload_dict = {}
 
     # 1) Discover from Google Places with strict radius (Haversine enforced inside)
     google_list = places.discover(payload_dict)
@@ -336,10 +337,10 @@ def preview(payload: RankPreviewPayload) -> RankPreviewResult:
     enriched = [extract.enrich(v) for v in filtered]
     sorted_scores = scoring.rank(enriched)
 
-    # 5) Package into schema
-    return RankPreviewResult(
-        results=sorted_scores,
-        candidates=enriched,
-    )
+    # 5) Return plain dict (no Pydantic schemas)
+    return {
+        "results": sorted_scores,
+        "candidates": enriched,
+    }
 
 
