@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.services import extract, merge, places, yelp
+from app.services import extract, merge, places, yelp  # yelp kept for future, but not used
 
 router = APIRouter()
 
@@ -10,21 +10,102 @@ router = APIRouter()
 # -----------------------------------------------------------------------------
 
 
+def _extract_state_from_address(addr: str | None) -> str | None:
+    """
+    Try to pull a 2-letter state code from a formatted address string.
+
+    Examples:
+      "123 Main St, Clarkston, MI 48348, USA" -> "MI"
+      "Denver, CO 80207, USA"                -> "CO"
+    """
+    if not addr:
+        return None
+
+    parts = [p.strip() for p in addr.split(",") if p.strip()]
+    if len(parts) < 2:
+        return None
+
+    # Usually the second-to-last part is "MI 48348" or just "MI"
+    state_zip = parts[-2]
+    tokens = state_zip.split()
+    if not tokens:
+        return None
+
+    code = tokens[0].strip()
+    if len(code) == 2 and code.isalpha():
+        return code.upper()
+
+    return None
+
+
+def _resolve_state(venue: dict) -> str | None:
+    """
+    Get the most reliable state we can find for a venue.
+    Priority:
+      1) Parsed from raw.formatted_address
+      2) venue["state"] if present
+    """
+    raw = venue.get("raw") or {}
+    addr = raw.get("formatted_address") or raw.get("address")
+    parsed = _extract_state_from_address(addr)
+    if parsed:
+        return parsed
+
+    # Fallback to any existing state field
+    state = venue.get("state")
+    if isinstance(state, str) and len(state) == 2:
+        return state.upper()
+
+    return None
+
+
+def _filter_by_geography(
+    candidates: list[dict],
+    payload: dict,
+) -> list[dict]:
+    """
+    Enforce geographic constraints:
+      - Must match requested state (if provided)
+      - Must be within radius_miles (if both distance_miles and radius_miles present)
+    """
+    requested_state = (payload.get("state") or "").strip().upper()
+    radius = payload.get("radius_miles")
+
+    filtered: list[dict] = []
+
+    for v in candidates:
+        # -------- State filter --------
+        if requested_state:
+            venue_state = _resolve_state(v)
+            if not venue_state or venue_state != requested_state:
+                # Wrong state → drop it
+                continue
+
+        # -------- Radius filter (optional) --------
+        if radius is not None:
+            try:
+                dist = float(v.get("distance_miles", 0))
+            except (TypeError, ValueError):
+                dist = None
+
+            if dist is not None and dist > float(radius) + 0.25:
+                # Add a small buffer just in case, but enforce radius
+                continue
+
+        filtered.append(v)
+
+    return filtered
+
+
 def _rank_inline(enriched_list: list[dict]) -> list[dict]:
     """
     Inline ranking / scoring logic.
 
-    Assumes each venue dict has:
-      - score (float)
-    and other metadata fields.
+    Assumes each venue dict has a 'score' field.
     """
-    # Defensive copy
-    items = list(enriched_list)
-
-    # Sort descending by score
+    items = list(enriched_list)  # defensive copy
     items.sort(key=lambda v: v.get("score", 0.0), reverse=True)
 
-    # Add rank field
     for i, v in enumerate(items, start=1):
         v["rank"] = i
 
@@ -38,7 +119,6 @@ def _to_html_table(ranked: list[dict]) -> str:
     if not ranked:
         return "<p>No venues found for this query.</p>"
 
-    # Define visible columns and headers
     columns = [
         ("rank", "Rank"),
         ("name", "Venue Name"),
@@ -55,13 +135,12 @@ def _to_html_table(ranked: list[dict]) -> str:
         ("log_score", "Log"),
     ]
 
-    # Build header
     th = "".join(f"<th>{label}</th>" for _, label in columns)
 
     rows_html = []
     for v in ranked:
         tds = []
-        for key, _ in columns:
+        for key, _label in columns:
             val = v.get(key, "")
             if key == "url" and val:
                 cell = f'<a href="{val}" target="_blank" rel="noopener noreferrer">{val}</a>'
@@ -72,7 +151,7 @@ def _to_html_table(ranked: list[dict]) -> str:
 
     body = "\n".join(rows_html)
 
-    table = f"""
+    return f"""
     <table class="results">
       <thead>
         <tr>{th}</tr>
@@ -82,7 +161,6 @@ def _to_html_table(ranked: list[dict]) -> str:
       </tbody>
     </table>
     """
-    return table
 
 
 def _wrap_html(content: str, title: str = "Venue Preview") -> str:
@@ -137,14 +215,6 @@ def _wrap_html(content: str, title: str = "Venue Preview") -> str:
     a:hover {{
       text-decoration: underline;
     }}
-    .notice {{
-      margin-bottom: 1rem;
-      padding: 0.75rem 1rem;
-      border-radius: 0.5rem;
-      background: #eff6ff;
-      color: #1d4ed8;
-      font-size: 0.85rem;
-    }}
   </style>
 </head>
 <body>
@@ -162,15 +232,21 @@ def _wrap_html(content: str, title: str = "Venue Preview") -> str:
 
 @router.post("/preview", response_class=HTMLResponse)
 def preview(payload: dict):
-    """Preview ranked venues for an arbitrary payload from the UI."""
+    """
+    Preview ranked venues for an arbitrary payload from the UI.
+    Google-only for now; Yelp is currently disabled.
+    """
     # Discover venues from Google Places
     google_list = places.discover(payload)
 
-    # NOTE: Yelp integration temporarily disabled; keep empty list to satisfy merge API
+    # Yelp integration is temporarily disabled; keep empty list for merge API
     yelp_list: list[dict] = []
 
-    # Merge and de-dupe candidate lists
+    # Merge and de-dupe
     candidates = merge.merge_candidates(google_list, yelp_list)
+
+    # Enforce geographic rules (state + radius)
+    candidates = _filter_by_geography(candidates, payload)
 
     # Enrich and rank
     enriched = [extract.enrich(v) for v in candidates]
@@ -183,12 +259,12 @@ def preview(payload: dict):
 @router.get("/sample", response_class=HTMLResponse)
 def preview_sample():
     """
-    Convenience endpoint for debugging:
-    uses a hard-coded payload instead of the UI form.
+    Convenience endpoint for debugging: uses a hard-coded payload.
     """
     payload = {
         "cities": ["Clarkston"],
         "zips": [],
+        "state": "MI",
         "radius_miles": 6,
         "window_start": "2025-05-01",
         "window_end": "2025-05-15",
@@ -199,6 +275,7 @@ def preview_sample():
     google_list = places.discover(payload)
     yelp_list: list[dict] = []
     candidates = merge.merge_candidates(google_list, yelp_list)
+    candidates = _filter_by_geography(candidates, payload)
 
     enriched = [extract.enrich(v) for v in candidates]
     ranked = _rank_inline(enriched)
@@ -210,11 +287,17 @@ def preview_sample():
 @router.post("/json", response_class=JSONResponse)
 def rank_json(payload: dict):
     """
-    JSON version of the ranking, useful for future API / automation.
+    JSON version of the ranking for future API / automation.
     """
     google_list = places.discover(payload)
     yelp_list: list[dict] = []
     candidates = merge.merge_candidates(google_list, yelp_list)
+    candidates = _filter_by_geography(candidates, payload)
+
+    enriched = [extract.enrich(v) for v in candidates]
+    ranked = _rank_inline(enriched)
+    return ranked
+
 
     enriched = [extract.enrich(v) for v in candidates]
     ranked = _rank_inline(enriched)
