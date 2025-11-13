@@ -6,9 +6,9 @@ from app.services import places, merge, extract, scoring
 
 router = APIRouter()
 
-
-# --- Blocklist for clearly bad / non-seminar venues -----------------------
-
+# ---------------------------------------------------------------------------
+# Blocklist for clearly bad / non-seminar venues
+# ---------------------------------------------------------------------------
 
 EXCLUDED_KEYWORDS: List[str] = [
     # Residential care / senior living
@@ -39,7 +39,6 @@ EXCLUDED_KEYWORDS: List[str] = [
     "rehabilitation center",
     "rehabilitation hospital",
     "physical therapy",
-    "physical therapy clinic",
     "outpatient rehab",
     "inpatient rehab",
     "hospital",
@@ -51,16 +50,11 @@ EXCLUDED_KEYWORDS: List[str] = [
     "walk-in clinic",
     "walk in clinic",
     "emergency room",
-    "er",
     "trauma center",
     "hospice",
     "home health care",
     "home healthcare",
     "medical group",
-    "orthopedic",
-    "cardiology",
-    "oncology",
-    "radiology",
 
     # Residential housing / apartments / condos
     "apartment",
@@ -137,35 +131,24 @@ EXCLUDED_KEYWORDS: List[str] = [
     "cemetery",
 ]
 
-
-# --- Helper utilities -----------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
 
 
 def _normalize_str(value: Any) -> str:
-    """
-    Normalize any value to a lowercase string for loose matching.
-    """
     if value is None:
         return ""
     return str(value).strip().lower()
 
 
 def _normalize_zip_list(raw: Any) -> List[str]:
-    """
-    Accepts a string, list, or other types and normalizes into
-    a list of lowercase ZIP-like fragments, stripping +4 where present.
-
-    Examples:
-      "48348, 48346" -> ["48348", "48346"]
-      ["48348-1234", " 48346 "] -> ["48348", "48346"]
-    """
     if raw is None:
         return []
 
     items: List[str] = []
 
     if isinstance(raw, str):
-        # split on comma or semicolon
         for part in raw.replace(";", ",").split(","):
             part = part.strip()
             if part:
@@ -186,7 +169,6 @@ def _normalize_zip_list(raw: Any) -> List[str]:
     for val in items:
         if not val:
             continue
-        # Strip ZIP+4
         if "-" in val and len(val) > 5:
             val = val.split("-", 1)[0]
         val = val.strip()
@@ -204,7 +186,6 @@ def is_irrelevant_venue(candidate: Dict[str, Any]) -> bool:
     category = _normalize_str(candidate.get("category"))
     vtype = _normalize_str(candidate.get("type"))
 
-    # Some sources may have a list of types/categories
     types = candidate.get("types") or candidate.get("categories") or []
     if isinstance(types, str):
         types_text = _normalize_str(types)
@@ -222,17 +203,9 @@ def is_irrelevant_venue(candidate: Dict[str, Any]) -> bool:
 
 def matches_geography(candidate: Dict[str, Any], payload: Dict[str, Any]) -> bool:
     """
-    Apply a light textual geography check on top of the strict radius filter
-    done in app.services.places.discover.
-
-    Logic:
-      - If a state is provided, require that state to appear somewhere
-        in the candidate's address/state fields.
-      - If any zip codes are provided, require at least one to appear in
-        the candidate's address OR fall back to city+state match.
-      - If no zips, but city is provided, require city match.
+    Light textual geography check on top of the strict radius filter
+    already applied inside app.services.places.discover.
     """
-    # Query side
     city_q = _normalize_str(
         payload.get("city") or payload.get("City") or payload.get("locality")
     )
@@ -250,7 +223,6 @@ def matches_geography(candidate: Dict[str, Any], payload: Dict[str, Any]) -> boo
     )
     zips_q = _normalize_zip_list(zip_raw)
 
-    # Candidate side – aggregate address-ish fields
     addr_bits: List[str] = []
     for key in (
         "formatted_address",
@@ -271,57 +243,44 @@ def matches_geography(candidate: Dict[str, Any], payload: Dict[str, Any]) -> boo
 
     address = _normalize_str(" ".join(addr_bits))
 
-    # --- State enforcement ---
     if state_q:
-        # Require the state code/name to show up somewhere
         if state_q not in address:
             return False
 
-    # --- ZIP + city logic ---
     if zips_q:
-        # Prefer zip match; fall back to city+state match if ZIP isn't present
         zip_match = any(z in address for z in zips_q)
-
         if not zip_match:
             if city_q and city_q not in address:
                 return False
     else:
-        # No zips provided – at least enforce city if present
         if city_q and city_q not in address:
             return False
 
     return True
 
 
-# --- Router endpoint ------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Router endpoint
+# ---------------------------------------------------------------------------
 
 
 @router.post("/preview")
 def preview(payload: dict = Body(...)) -> Dict[str, Any]:
     """
     Preview ranked venue candidates.
-
-    Flow:
-      1. Discover candidates from Google Places via app.services.places.discover.
-      2. Merge/dedupe via app.services.merge.merge_candidates.
-      3. Apply geography and keyword filters.
-      4. Enrich & score remaining candidates.
-      5. Return a dict with both scores and raw candidates.
     """
-    # Ensure mapping-style access everywhere
     if isinstance(payload, dict):
         payload_dict: Dict[str, Any] = payload
     else:
-        # Extremely defensive: if something else is passed, try best-effort
         try:
             payload_dict = dict(payload)  # type: ignore[arg-type]
         except Exception:
             payload_dict = {}
 
-    # 1) Discover from Google Places with strict radius (Haversine enforced inside)
+    # 1) Discover from Google with strict radius
     google_list = places.discover(payload_dict)
 
-    # 2) Merge candidates – Yelp is not currently used; pass an empty list
+    # 2) Merge candidates – Yelp not wired yet
     merged = merge.merge_candidates(google_list, [])
 
     # 3) Apply geography + blocklist filters
@@ -333,28 +292,33 @@ def preview(payload: dict = Body(...)) -> Dict[str, Any]:
             continue
         filtered.append(cand)
 
-    # 4) Enrich & score inline (no scoring.rank)
+    # 4) Enrich & score
     enriched: List[Dict[str, Any]] = []
     for v in filtered:
-        v_enriched = extract.enrich(v)
-        # Try to score with scoring.score_venue; fall back to 0.0 if missing
-        score = 0.0
+        v_enriched = extract.enrich(dict(v))
         try:
-            if hasattr(scoring, "score_venue"):
-                score = float(scoring.score_venue(v_enriched))  # type: ignore[arg-type]
-            elif hasattr(scoring, "score"):
-                score = float(scoring.score(v_enriched))  # type: ignore[arg-type]
+            total, reason, comps = scoring.score(v_enriched)
         except Exception:
-            # Leave score as 0.0 on failure
-            score = 0.0
+            total, reason, comps = 0.0, "", {}
 
-        v_enriched["score"] = score
+        v_enriched["score"] = total
+        v_enriched["score_reason"] = reason
+
+        # Normalize component names for the UI columns
+        v_enriched["educationality"] = comps.get("educationality")
+        v_enriched["availability_score"] = comps.get("availability")
+        v_enriched["capacity_score"] = comps.get("capacity_fit")
+        v_enriched["amenities_score"] = comps.get("amenities")
+        v_enriched["logistics_score"] = comps.get("logistics")
+
         enriched.append(v_enriched)
 
     # 5) Sort by score descending
-    enriched_sorted = sorted(enriched, key=lambda x: x.get("score", 0.0), reverse=True)
+    enriched_sorted = sorted(
+        enriched, key=lambda x: x.get("score", 0.0), reverse=True
+    )
 
-    # 6) Return plain dict (no Pydantic schemas)
+    # 6) Return plain dict (JSON)
     return {
         "results": enriched_sorted,
         "candidates": enriched_sorted,
