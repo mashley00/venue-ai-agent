@@ -1,169 +1,222 @@
 from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
-from typing import List
-import pandas as pd
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.services import scoring, places, yelp, extract, merge
-from app.services.geo import geocode, haversine_miles
-
-def _final_radius_filter(cands: list, payload: dict) -> list:
-    cities = payload.get("cities") or []
-    zips = payload.get("zips") or []
-    radius_miles = int(payload.get("radius_miles", 6))
-    targets = cities if cities else zips
-    anchors = []
-    for t in targets:
-        g = geocode(t)
-        if g:
-            anchors.append((g["lat"], g["lng"]))
-    if not anchors:
-        return cands
-    kept = []
-    for v in cands:
-        vlat, vlng = v.get("lat"), v.get("lng")
-        if vlat is None or vlng is None:
-            continue
-        in_any = False
-        for (alat, alng) in anchors:
-            if haversine_miles(alat, alng, vlat, vlng) <= radius_miles:
-                in_any = True
-                break
-        if in_any:
-            kept.append(v)
-    return kept
+from app.services import extract, merge, places, yelp
 
 router = APIRouter()
 
-# -----------------------
-# Shared helpers
-# -----------------------
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
-TABLE_COLUMNS = [
-    ("rank", "Rank"),
-    ("name", "Venue"),
-    ("category", "Category"),
-    ("educationality", "Edu"),
-    ("city", "City"),
-    ("distance_miles", "Mi"),
-    ("availability_status", "Avail"),
-    ("website_url", "Website"),
-    ("booking_url", "Booking"),
-    ("phone", "Phone"),
-    ("reason_text", "Why this rank"),
-]
 
-def _rank_inline(venues: List[dict]) -> List[dict]:
-    ranked = []
-    for v in venues:
-        total, reason, comps = scoring.score(v)
-        v["score_total"] = total
-        v["reason_text"] = reason
-        v["score_components"] = comps
-        ranked.append(v)
-    ranked.sort(key=lambda x: x.get("score_total", 0), reverse=True)
-    for i, v in enumerate(ranked, start=1):
+def _rank_inline(enriched_list: list[dict]) -> list[dict]:
+    """
+    Inline ranking / scoring logic.
+
+    Assumes each venue dict has:
+      - score (float)
+    and other metadata fields.
+    """
+    # Defensive copy
+    items = list(enriched_list)
+
+    # Sort descending by score
+    items.sort(key=lambda v: v.get("score", 0.0), reverse=True)
+
+    # Add rank field
+    for i, v in enumerate(items, start=1):
         v["rank"] = i
-    return ranked
 
-def _to_html_table(ranked: List[dict]) -> str:
-    rows = []
+    return items
+
+
+def _to_html_table(ranked: list[dict]) -> str:
+    """
+    Render a simple HTML table for the preview UI.
+    """
+    if not ranked:
+        return "<p>No venues found for this query.</p>"
+
+    # Define visible columns and headers
+    columns = [
+        ("rank", "Rank"),
+        ("name", "Venue Name"),
+        ("venue_type", "Type"),
+        ("city", "City"),
+        ("distance_miles", "Miles"),
+        ("source", "Source"),
+        ("url", "URL"),
+        ("phone", "Phone"),
+        ("education_score", "Edu"),
+        ("availability_score", "Avail"),
+        ("capacity_score", "Cap"),
+        ("ams_score", "Ams"),
+        ("log_score", "Log"),
+    ]
+
+    # Build header
+    th = "".join(f"<th>{label}</th>" for _, label in columns)
+
+    rows_html = []
     for v in ranked:
-        row = {col_key: v.get(col_key) for col_key, _ in TABLE_COLUMNS}
-        rows.append(row)
-    if not rows:
-        df = pd.DataFrame(columns=[h for _, h in TABLE_COLUMNS])
-    else:
-        df = pd.DataFrame(rows)
-        df.columns = [h for _, h in TABLE_COLUMNS]
-    return df.to_html(index=False, border=0, escape=False)
+        tds = []
+        for key, _ in columns:
+            val = v.get(key, "")
+            if key == "url" and val:
+                cell = f'<a href="{val}" target="_blank" rel="noopener noreferrer">{val}</a>'
+            else:
+                cell = str(val)
+            tds.append(f"<td>{cell}</td>")
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
 
-CSS = """
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;}
-h1{margin:0 0 12px 0;font-size:22px}
-p.hint{margin:4px 0 16px 0;color:#666}
-table{border-collapse:collapse;width:100%}
-th,td{padding:10px;border-bottom:1px solid #eee;vertical-align:top}
-th{text-align:left;background:#fafafa}
-a{color:#0a58ca;text-decoration:none}
-a:hover{text-decoration:underline}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;background:#eef;border:1px solid #dde}
-</style>
-"""
+    body = "\n".join(rows_html)
 
-def _wrap_html(inner: str, title="Venue Preview") -> str:
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{title}</title>{CSS}</head><body>"
-        "<h1>Venue Preview</h1>"
-        "<p class='hint'>This is a quick on-screen preview. "
-        "Use <code>/rank/run</code> for JSON/CSV/XLSX exports.</p>"
-        f"{inner}</body></html>"
-    )
+    table = f"""
+    <table class="results">
+      <thead>
+        <tr>{th}</tr>
+      </thead>
+      <tbody>
+        {body}
+      </tbody>
+    </table>
+    """
+    return table
 
-# -----------------------
-# API: JSON rank (kept for automation/export)
-# -----------------------
 
-@router.post("/run")
-def run_rank(payload: dict):
-    # 1) Discover (Google + Yelp) and merge/de-dupe
-    candidates = merge.merge_candidates(
-        places.discover(payload)
-    )
-    # 2) Enrich (stub for now)
-    enriched = [extract.enrich(v) for v in candidates]
-    # 3) Rank
-    ranked = _rank_inline(enriched)
+def _wrap_html(content: str, title: str = "Venue Preview") -> str:
+    """
+    Basic HTML wrapper used by the /rank/preview endpoint.
+    """
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{title}</title>
+  <style>
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 1.5rem;
+      background: #f6f7fb;
+      color: #111827;
+    }}
+    h1 {{
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+    }}
+    table.results {{
+      border-collapse: collapse;
+      width: 100%;
+      background: white;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+      border-radius: 0.5rem;
+      overflow: hidden;
+    }}
+    table.results th,
+    table.results td {{
+      padding: 0.5rem 0.75rem;
+      border-bottom: 1px solid #e5e7eb;
+      font-size: 0.85rem;
+      vertical-align: top;
+    }}
+    table.results th {{
+      background: #f3f4f6;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+    }}
+    table.results tr:nth-child(even) td {{
+      background: #f9fafb;
+    }}
+    a {{
+      color: #2563eb;
+      text-decoration: none;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+    .notice {{
+      margin-bottom: 1rem;
+      padding: 0.75rem 1rem;
+      border-radius: 0.5rem;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-size: 0.85rem;
+    }}
+  </style>
+</head>
+<body>
+  <h1>{title}</h1>
+  {content}
+</body>
+</html>
+    """.strip()
 
-    # Optional export for automation consumers
-    df = pd.DataFrame(ranked)
-    csv_path = "exports/venues_ranked.csv"
-    xlsx_path = "exports/venues_ranked.xlsx"
-    try:
-        df.to_csv(csv_path, index=False)
-    except Exception as _:
-        pass
-    try:
-        df.to_excel(xlsx_path, index=False)
-    except Exception as _:
-        pass
 
-    return {"results": ranked, "export_csv": csv_path, "export_xlsx": xlsx_path}
+# -----------------------------------------------------------------------------
+# API endpoints
+# -----------------------------------------------------------------------------
 
-# -----------------------
-# API: HTML preview endpoints
-# -----------------------
 
 @router.post("/preview", response_class=HTMLResponse)
 def preview(payload: dict):
-    # 1) Discover (Google + Yelp) and merge/de-dupe
-    candidates = merge.merge_candidates(
-        places.discover(payload)
-    )
-    # 2) Enrich (stub for now)
+    """Preview ranked venues for an arbitrary payload from the UI."""
+    # Discover venues from Google Places
+    google_list = places.discover(payload)
+
+    # NOTE: Yelp integration temporarily disabled; keep empty list to satisfy merge API
+    yelp_list: list[dict] = []
+
+    # Merge and de-dupe candidate lists
+    candidates = merge.merge_candidates(google_list, yelp_list)
+
+    # Enrich and rank
     enriched = [extract.enrich(v) for v in candidates]
-    # 3) Rank and render
     ranked = _rank_inline(enriched)
+
     table_html = _to_html_table(ranked)
     return _wrap_html(table_html, title="Venue Preview")
 
-@router.get("/preview-sample", response_class=HTMLResponse)
+
+@router.get("/sample", response_class=HTMLResponse)
 def preview_sample():
+    """
+    Convenience endpoint for debugging:
+    uses a hard-coded payload instead of the UI form.
+    """
     payload = {
-        "cities": ["Greenville, NC"],
-        "zips": ["27834"],
+        "cities": ["Clarkston"],
+        "zips": [],
         "radius_miles": 6,
-        "window_start": "2025-05-08",
-        "window_end": "2025-05-22",
-        "attendees": 30,
-        "preferred_slots": ["11:00","11:30","18:00","18:30"]
+        "window_start": "2025-05-01",
+        "window_end": "2025-05-15",
+        "attendees": 40,
+        "preferred_slots": ["11:00", "18:00"],
     }
-    candidates = merge.merge_candidates(
-        places.discover(payload)
-    )
+
+    google_list = places.discover(payload)
+    yelp_list: list[dict] = []
+    candidates = merge.merge_candidates(google_list, yelp_list)
+
     enriched = [extract.enrich(v) for v in candidates]
     ranked = _rank_inline(enriched)
+
     table_html = _to_html_table(ranked)
-    return _wrap_html(table_html, title="Venue Preview (Sample)")
+    return _wrap_html(table_html, title="Sample Venue Preview")
+
+
+@router.post("/json", response_class=JSONResponse)
+def rank_json(payload: dict):
+    """
+    JSON version of the ranking, useful for future API / automation.
+    """
+    google_list = places.discover(payload)
+    yelp_list: list[dict] = []
+    candidates = merge.merge_candidates(google_list, yelp_list)
+
+    enriched = [extract.enrich(v) for v in candidates]
+    ranked = _rank_inline(enriched)
+    return ranked
 
