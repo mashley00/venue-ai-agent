@@ -333,14 +333,31 @@ def preview(payload: dict = Body(...)) -> Dict[str, Any]:
             continue
         filtered.append(cand)
 
-    # 4) Enrich & score
-    enriched = [extract.enrich(v) for v in filtered]
-    sorted_scores = scoring.rank(enriched)
+    # 4) Enrich & score inline (no scoring.rank)
+    enriched: List[Dict[str, Any]] = []
+    for v in filtered:
+        v_enriched = extract.enrich(v)
+        # Try to score with scoring.score_venue; fall back to 0.0 if missing
+        score = 0.0
+        try:
+            if hasattr(scoring, "score_venue"):
+                score = float(scoring.score_venue(v_enriched))  # type: ignore[arg-type]
+            elif hasattr(scoring, "score"):
+                score = float(scoring.score(v_enriched))  # type: ignore[arg-type]
+        except Exception:
+            # Leave score as 0.0 on failure
+            score = 0.0
 
-    # 5) Return plain dict (no Pydantic schemas)
+        v_enriched["score"] = score
+        enriched.append(v_enriched)
+
+    # 5) Sort by score descending
+    enriched_sorted = sorted(enriched, key=lambda x: x.get("score", 0.0), reverse=True)
+
+    # 6) Return plain dict (no Pydantic schemas)
     return {
-        "results": sorted_scores,
-        "candidates": enriched,
+        "results": enriched_sorted,
+        "candidates": enriched_sorted,
     }
 
 
